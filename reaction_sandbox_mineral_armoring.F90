@@ -23,6 +23,20 @@ module Reaction_Sandbox_Mineral_Armoring_class
 ! armoring mineral has been completely dissolved (MINERAL exposed at its
 ! full initial surface area).
 !
+! Optionally, the surface area of MINERAL is also reduced as MINERAL itself
+! is consumed by dissolution (shrinking-particle behavior):
+!
+!   area = area * (volfrac / volfrac0) ** DEPLETION_POWER
+!
+! where volfrac/volfrac0 are the current/initial volume fractions of
+! MINERAL in the grid cell. This factor is applied to dissolution only, so
+! that the rate goes to zero smoothly as MINERAL is exhausted. The default
+! DEPLETION_POWER of 0 disables the factor (area depends only on armoring).
+!
+! Regardless of DEPLETION_POWER, the dissolution rate is capped so that a
+! single transport timestep cannot dissolve more MINERAL than remains in
+! the grid cell.
+!
 ! The dissolution/precipitation rate for MINERAL is otherwise computed with
 ! a standard single-term TST-like rate law leveraging the stoichiometry and
 ! logK for MINERAL already present in the thermodynamic database, with an
@@ -31,6 +45,23 @@ module Reaction_Sandbox_Mineral_Armoring_class
 !
 !   rate = -area * sign(1-QK) * |1-QK| * RATE_CONSTANT * &
 !           {PREFACTOR_SPECIES activity}**PREFACTOR_ALPHA * arrhenius_factor
+!
+! Optional low-concentration cutoff on the prefactor species (e.g. O2(aq)):
+!
+!   rate = rate * m / (PREFACTOR_HALF_SATURATION + m)
+!
+! where m is the molality of PREFACTOR_SPECIES. With a half-saturation
+! constant far below normal concentrations (e.g. 1e-9 M for O2) the factor
+! is ~1 wherever the species is present, but the rate goes to zero smoothly
+! (order alpha+1) at trace levels, so a sub-linear sink cannot drive the
+! species toward zero in anoxic cells (log-formulation underflow).
+! Default 0 disables the factor.
+!
+! NO_ARMORING sets f_dissolved = 1 everywhere (ARMORING_MINERAL is then not
+! needed). With DEPLETION_POWER 2/3 this reproduces the standard continuum
+! rate law (MINERAL_KINETICS with SURFACE_AREA_FUNCTION VOLUME_FRACTION_RATIO,
+! power 2/3), so armored and continuum runs can share one rate law and one
+! O2 cutoff and differ only in the armoring factor.
 !
 ! For REACTION_SANDBOX,MINERAL_ARMORING to function correctly, the
 ! corresponding entry for MINERAL within the default MINERAL_KINETICS block
@@ -58,6 +89,7 @@ module Reaction_Sandbox_Mineral_Armoring_class
 !       PREFACTOR_ALPHA 0.5
 !       ACTIVATION_ENERGY 5.d4 J/mol
 !       SURFACE_AREA_POWER 0.66666667
+!       DEPLETION_POWER 0.66666667
 !     END
 !   END
 !   ...
@@ -76,7 +108,10 @@ module Reaction_Sandbox_Mineral_Armoring_class
     PetscReal :: activation_energy
     PetscReal :: prefactor_alpha
     PetscReal :: surface_area_power
+    PetscReal :: depletion_power
     PetscReal :: affinity_threshold
+    PetscReal :: prefactor_half_sat
+    PetscBool :: no_armoring
   contains
     procedure, public :: ReadInput => MineralArmoringReadInput
     procedure, public :: Setup => MineralArmoringSetup
@@ -115,7 +150,10 @@ function MineralArmoringCreate()
   MineralArmoringCreate%activation_energy = 0.d0
   MineralArmoringCreate%prefactor_alpha = UNINITIALIZED_DOUBLE
   MineralArmoringCreate%surface_area_power = UNINITIALIZED_DOUBLE
+  MineralArmoringCreate%depletion_power = 0.d0
   MineralArmoringCreate%affinity_threshold = 0.d0
+  MineralArmoringCreate%prefactor_half_sat = 0.d0
+  MineralArmoringCreate%no_armoring = PETSC_FALSE
   nullify(MineralArmoringCreate%next)
 
 end function MineralArmoringCreate
@@ -182,9 +220,17 @@ subroutine MineralArmoringReadInput(this,input,option)
       case('SURFACE_AREA_POWER')
         call InputReadDouble(input,option,this%surface_area_power)
         call InputErrorMsg(input,option,word,error_string)
+      case('DEPLETION_POWER')
+        call InputReadDouble(input,option,this%depletion_power)
+        call InputErrorMsg(input,option,word,error_string)
       case('AFFINITY_THRESHOLD')
         call InputReadDouble(input,option,this%affinity_threshold)
         call InputErrorMsg(input,option,word,error_string)
+      case('PREFACTOR_HALF_SATURATION')
+        call InputReadDouble(input,option,this%prefactor_half_sat)
+        call InputErrorMsg(input,option,word,error_string)
+      case('NO_ARMORING')
+        this%no_armoring = PETSC_TRUE
       case default
         call InputKeywordUnrecognized(input,word,error_string,option)
     end select
@@ -192,9 +238,18 @@ subroutine MineralArmoringReadInput(this,input,option)
   call InputPopBlock(input,option)
 
   if (len_trim(this%mineral_name) == 0 .or. &
-      len_trim(this%armor_mineral_name) == 0) then
+      (len_trim(this%armor_mineral_name) == 0 .and. &
+       .not.this%no_armoring)) then
     option%io_buffer = 'MINERAL and ARMORING_MINERAL must be set for &
       &REACTION_SANDBOX,MINERAL_ARMORING.'
+    call PrintErrMsg(option)
+  endif
+  if (.not.this%no_armoring .and. &
+      StringCompareIgnoreCase(this%mineral_name, &
+                              this%armor_mineral_name)) then
+    option%io_buffer = 'MINERAL and ARMORING_MINERAL must differ for &
+      &REACTION_SANDBOX,MINERAL_ARMORING ('//trim(this%mineral_name)// &
+      &'), as a mineral armoring itself would never react.'
     call PrintErrMsg(option)
   endif
   if (Uninitialized(this%rate_constant) .or. &
@@ -207,6 +262,18 @@ subroutine MineralArmoringReadInput(this,input,option)
       Uninitialized(this%prefactor_alpha)) then
     option%io_buffer = 'PREFACTOR_ALPHA must be set when PREFACTOR_SPECIES &
       &is specified for REACTION_SANDBOX,MINERAL_ARMORING.'
+    call PrintErrMsg(option)
+  endif
+  if (this%prefactor_half_sat < 0.d0 .or. &
+      (this%prefactor_half_sat > 0.d0 .and. &
+       len_trim(this%prefactor_species_name) == 0)) then
+    option%io_buffer = 'PREFACTOR_HALF_SATURATION must be non-negative and &
+      &requires PREFACTOR_SPECIES for REACTION_SANDBOX,MINERAL_ARMORING.'
+    call PrintErrMsg(option)
+  endif
+  if (this%depletion_power < 0.d0) then
+    option%io_buffer = 'DEPLETION_POWER must be non-negative for &
+      &REACTION_SANDBOX,MINERAL_ARMORING.'
     call PrintErrMsg(option)
   endif
 
@@ -240,9 +307,11 @@ subroutine MineralArmoringSetup(this,reaction,option)
   this%mineral_id = &
     ReactionMnrlGetKinMnrlIDFromName(this%mineral_name,reaction%mineral, &
                                      option)
-  this%armor_mineral_id = &
-    ReactionMnrlGetKinMnrlIDFromName(this%armor_mineral_name, &
-                                     reaction%mineral,option)
+  if (len_trim(this%armor_mineral_name) > 0) then
+    this%armor_mineral_id = &
+      ReactionMnrlGetKinMnrlIDFromName(this%armor_mineral_name, &
+                                       reaction%mineral,option)
+  endif
   if (len_trim(this%prefactor_species_name) > 0) then
     this%prefactor_species_id = &
       ReactionAuxGetPriSpecIDFromName(this%prefactor_species_name,reaction, &
@@ -324,6 +393,7 @@ subroutine MineralArmoringEvaluate(this,Residual,Jacobian,compute_derivative, &
   PetscReal :: ln_conc(reaction%ncomp)
   PetscReal :: ln_act(reaction%ncomp)
   PetscReal :: volfrac0_armor, volfrac_armor, f_dissolved
+  PetscReal :: volfrac0, volfrac
   PetscReal :: area
   PetscReal :: rate
   PetscReal :: lnQK, QK
@@ -359,9 +429,12 @@ subroutine MineralArmoringEvaluate(this,Residual,Jacobian,compute_derivative, &
 
   ! fraction of the armoring mineral that has dissolved, normalized by the
   ! LOCAL initial volume fraction in this grid cell
-  volfrac0_armor = rt_auxvar%mnrl_volfrac0(imnrl_armor)
-  volfrac_armor = rt_auxvar%mnrl_volfrac(imnrl_armor)
-  if (volfrac0_armor > 0.d0) then
+  if (this%no_armoring) then
+    ! continuum: MINERAL fully exposed from t = 0
+    f_dissolved = 1.d0
+  else if (rt_auxvar%mnrl_volfrac0(imnrl_armor) > 0.d0) then
+    volfrac0_armor = rt_auxvar%mnrl_volfrac0(imnrl_armor)
+    volfrac_armor = rt_auxvar%mnrl_volfrac(imnrl_armor)
     f_dissolved = (volfrac0_armor-volfrac_armor)/volfrac0_armor
     f_dissolved = max(0.d0,min(1.d0,f_dissolved))
   else
@@ -401,15 +474,38 @@ subroutine MineralArmoringEvaluate(this,Residual,Jacobian,compute_derivative, &
     if (this%prefactor_species_id > 0) then
       prefactor_term = exp(this%prefactor_alpha* &
                            ln_act(this%prefactor_species_id))
+      ! optional smooth cutoff at trace prefactor-species concentration
+      if (this%prefactor_half_sat > 0.d0) then
+        prefactor_term = prefactor_term* &
+          rt_auxvar%pri_molal(this%prefactor_species_id)/ &
+          (this%prefactor_half_sat+ &
+           rt_auxvar%pri_molal(this%prefactor_species_id))
+      endif
     endif
     arrhenius_factor = 1.d0
     if (this%activation_energy > 0.d0) then
       arrhenius_factor = Arrhenius(this%activation_energy, &
                                    global_auxvar%temp,TREF)
     endif
+    ! optional shrinking of MINERAL surface area as MINERAL is consumed
+    ! (dissolution only)
+    volfrac0 = rt_auxvar%mnrl_volfrac0(imnrl)
+    volfrac = rt_auxvar%mnrl_volfrac(imnrl)
+    if (sign_ > 0.d0 .and. this%depletion_power > 0.d0 .and. &
+        volfrac0 > 0.d0) then
+      area = area*(max(0.d0,volfrac)/volfrac0)**this%depletion_power
+    endif
     ! mol/sec/m^3 bulk
     rate = -area*sign_*dabs(affinity_factor)*this%rate_constant* &
            prefactor_term*arrhenius_factor
+    ! limit dissolution to the MINERAL remaining in the grid cell so that
+    ! the final timestep cannot release more solute than the mineral holds
+    ! (volume fraction is only updated after the timestep converges)
+    if (sign_ > 0.d0 .and. option%tran_dt > 0.d0) then
+      ! mol/sec/m^3 bulk
+      rate = max(rate,-max(0.d0,volfrac)/ &
+                 (mineral%kinmnrl_molar_vol(imnrl)*option%tran_dt))
+    endif
   endif
 
   rt_auxvar%auxiliary_data(iauxiliary) = rate

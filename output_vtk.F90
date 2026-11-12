@@ -468,6 +468,14 @@ subroutine WriteVTKDataSet(fid,realization_base,dataset_name,array,datatype, &
   PetscReal, allocatable :: real_data(:), real_data_recv(:)
   PetscErrorCode :: ierr
 
+! VTK SCALARS data is declared type "float" (32-bit) in the header below,
+! but real_data holds full double-precision values. Any value outside
+! the representable range of a 32-bit IEEE float (roughly 1.18d-38 to
+! 3.4d38 in magnitude) -- e.g. a reaction sandbox rate that legitimately
+! underflows toward zero far from a reaction front -- corrupts the
+! legacy VTK ASCII parser when it tries to read that token as a float,
+! desynchronizing the rest of the file. Values are clamped to this range
+! (see VTKClampToFloatRange below) before being written here.
 1001 format(10(es13.6,1x))
 1002 format(i3)
 
@@ -512,17 +520,25 @@ subroutine WriteVTKDataSet(fid,realization_base,dataset_name,array,datatype, &
     allocate(real_data(max_local_size+10))
     allocate(real_data_recv(max_local_size))
     do i=1,local_size_mpi
-      real_data(i) = array(i)
+      ! clamp to the representable range of the 32-bit float the VTK
+      ! SCALARS data is declared as below; see comment on format 1001
+      real_data(i) = sign(min(dabs(array(i)),3.0d38),array(i))
+      if (dabs(real_data(i)) < 1.0d-38) real_data(i) = 0.d0
     enddo
   endif
 
   ! communicate data to processor 0, round robin style
   if (OptionIsIORank(option)) then
 
+    ! field width must match the declared length of dataset_name
+    ! (character(len=MAXWORDLENGTH)) above; a narrower width silently
+    ! truncates longer variable names (e.g. reaction sandbox auxiliary
+    ! plot variable names), which can make two distinct variables collide
+    ! on the same truncated SCALARS name in the VTK file
     if (datatype == VTK_INTEGER) then
-      write(fid,'(''SCALARS '',a20,'' int 1'')') dataset_name
+      write(fid,'(''SCALARS '',a32,'' int 1'')') dataset_name
     else
-      write(fid,'(''SCALARS '',a20,'' float 1'')') dataset_name
+      write(fid,'(''SCALARS '',a32,'' float 1'')') dataset_name
     endif
 
     write(fid,'(''LOOKUP_TABLE default'')')
